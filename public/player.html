@@ -26,45 +26,52 @@
   <h2>Playback Error</h2>
   <p id="err-msg"></p>
 </div>
+<script src="https://cdn.jsdelivr.net/npm/hls.js@1/dist/hls.min.js"></script>
 <script>
-  var p   = new URLSearchParams(location.search);
-  var src = p.get('url');
-  var sub = p.get('sub');
-  var v   = document.getElementById('v');
+  var p      = new URLSearchParams(location.search);
+  var src    = p.get('url');   // raw streamUrl, NOT the proxied one
+  var sub    = p.get('sub');   // direct subtitle URL, not proxied
+  var v      = document.getElementById('v');
 
   function showErr(msg) {
     document.getElementById('err-msg').textContent = msg || 'Unknown error';
     document.getElementById('err').classList.add('show');
   }
 
-  if (!src) { showErr('No stream URL provided (?url= is missing).'); }
+  if (!src) { showErr('No stream URL provided.'); }
   else {
-    // Attach subtitle track if provided
     if (sub) {
       var track = document.createElement('track');
-      track.kind    = 'subtitles';
-      track.label   = 'English';
-      track.srclang = 'en';
-      track.src     = sub;
-      track.default = true;
+      track.kind = 'subtitles'; track.label = 'English';
+      track.srclang = 'en'; track.src = sub; track.default = true;
       v.appendChild(track);
     }
 
+    // Parse any headers baked into the URL query string
+    var extraHeaders = {};
+    try {
+      var u = new URL(src);
+      var h = u.searchParams.get('headers');
+      if (h) extraHeaders = JSON.parse(h);
+    } catch(_) {}
+
     if (Hls.isSupported()) {
-      var hls = new Hls({ enableWorker: true });
+      var hls = new Hls({
+        enableWorker: true,
+        xhrSetup: function(xhr) {
+          // Can't set Referer/Origin from browser JS (blocked by spec)
+          // but most CDNs only check these server-side, so direct play
+          // usually works fine from a residential browser IP
+        }
+      });
       hls.loadSource(src);
       hls.attachMedia(v);
-      hls.on(Hls.Events.MANIFEST_PARSED, function() {
-        v.play().catch(function() {});
-      });
-      hls.on(Hls.Events.ERROR, function(_, d) {
-        if (d.fatal) showErr(d.details || 'HLS fatal error');
-      });
+      hls.on(Hls.Events.MANIFEST_PARSED, function() { v.play().catch(function(){}); });
+      hls.on(Hls.Events.ERROR, function(_, d) { if (d.fatal) showErr(d.details); });
     } else if (v.canPlayType('application/vnd.apple.mpegurl')) {
-      v.src = src;
-      v.play().catch(function(e) { showErr(e.message); });
+      v.src = src; v.play().catch(function(e) { showErr(e.message); });
     } else {
-      showErr('HLS playback is not supported in this browser.');
+      showErr('HLS not supported in this browser.');
     }
   }
 </script>

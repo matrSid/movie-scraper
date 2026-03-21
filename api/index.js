@@ -193,10 +193,9 @@ module.exports = async function handler(req, res) {
       ) || subtitles[0] || null;
 
       // Embed this playerUrl directly in an <iframe> on your main site
-      const playerUrl = selfBase + '/player?url='
-        + encodeURIComponent(proxyUrl)
-        + (defaultSubtitle ? '&sub=' + encodeURIComponent(defaultSubtitle.proxyUrl) : '');
-
+      const playerUrl = selfBase + '/player.html?url='
+        + encodeURIComponent(streamUrl)
+        + (defaultSubtitle ? '&sub=' + encodeURIComponent(defaultSubtitle.url) : '');
       return json(200, {
         id:      q.id,
         season:  q.s  || null,
