@@ -195,7 +195,7 @@ module.exports = async function handler(req, res) {
       // Embed this playerUrl directly in an <iframe> on your main site
       const playerUrl = selfBase + '/player.html?url='
         + encodeURIComponent(streamUrl)
-        + (defaultSubtitle ? '&sub=' + encodeURIComponent(defaultSubtitle.url) : '');
+        + (defaultSubtitle ? '&sub=' + encodeURIComponent(defaultSubtitle.proxyUrl) : '');
       return json(200, {
         id:      q.id,
         season:  q.s  || null,
