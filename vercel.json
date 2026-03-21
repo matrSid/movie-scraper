@@ -6,6 +6,7 @@
     }
   },
   "rewrites": [
+    { "source": "/player", "destination": "/public/player.html" },
     { "source": "/api/(.*)", "destination": "/api/index.js" }
   ]
 }

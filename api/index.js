@@ -36,14 +36,18 @@ function bootWasm() {
   return bootPromise;
 }
 
-// ── Parse headers embedded in a URL's query string ───────────────────────────
-// Some CDN URLs carry ?headers={"referer":"...","origin":"..."} — we must
-// forward those or the upstream returns 401.
+// ── Parse headers + host embedded in a CDN URL's query string ────────────────
 function parseEmbeddedHeaders(url) {
   try {
     const urlObj = new URL(url);
     const raw    = urlObj.searchParams.get('headers');
-    if (raw) return JSON.parse(raw);
+    const host   = urlObj.searchParams.get('host');
+    const parsed = raw ? JSON.parse(raw) : {};
+    if (host) {
+      parsed.referer = parsed.referer || (host + '/');
+      parsed.origin  = parsed.origin  || host;
+    }
+    return parsed;
   } catch (_) {}
   return {};
 }
@@ -74,7 +78,7 @@ function fetchUpstream(url, redirects = 0, extraHeaders = {}) {
   });
 }
 
-// ── M3U8 rewriter — rewrites segment/playlist URLs through our proxy ──────────
+// ── M3U8 rewriter ─────────────────────────────────────────────────────────────
 function rewriteM3u8(body, url, baseProxyUrl) {
   const base    = url.split('?')[0];
   const baseDir = base.substring(0, base.lastIndexOf('/') + 1);
@@ -89,14 +93,14 @@ function rewriteM3u8(body, url, baseProxyUrl) {
   }).join('\n');
 }
 
-// ── SRT → WebVTT conversion ───────────────────────────────────────────────────
+// ── SRT → WebVTT ──────────────────────────────────────────────────────────────
 function srtToVtt(srt) {
   return 'WEBVTT\n\n' + srt
     .replace(/\r\n/g, '\n').replace(/\r/g, '\n')
     .replace(/(\d{2}:\d{2}:\d{2}),(\d{3})/g, '$1.$2');
 }
 
-// ── Normalise subtitle tracks from API response ───────────────────────────────
+// ── Normalise subtitle tracks ─────────────────────────────────────────────────
 function extractSubtitles(data, selfBase) {
   const raw =
     data?.stream?.captions  ||
@@ -152,13 +156,7 @@ async function resolveStream(id, season, episode, selfBase) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  ROUTE TABLE
-//  GET /api/stream?id=&[s=&e=]   →  { streamUrl, proxyUrl, subtitles[] }
-//  GET /api/hls?url=              →  proxied / rewritten M3U8 or TS segment
-//  GET /api/sub?url=              →  proxied subtitle (auto-converts SRT→VTT)
-// ─────────────────────────────────────────────────────────────────────────────
 module.exports = async function handler(req, res) {
-  // ── CORS ────────────────────────────────────────────────────────────────
   res.setHeader('Access-Control-Allow-Origin',  '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
@@ -167,7 +165,11 @@ module.exports = async function handler(req, res) {
   const reqUrl   = new URL(req.url, 'http://localhost');
   const route    = reqUrl.pathname;
   const q        = Object.fromEntries(reqUrl.searchParams);
-  const selfBase = process.env.VERCEL_URL
+
+  // Prefer the stable production URL over the per-deployment preview URL
+  const selfBase = process.env.VERCEL_PROJECT_PRODUCTION_URL
+    ? `https://${process.env.VERCEL_PROJECT_PRODUCTION_URL}`
+    : process.env.VERCEL_URL
     ? `https://${process.env.VERCEL_URL}`
     : '';
 
@@ -183,28 +185,37 @@ module.exports = async function handler(req, res) {
 
     try {
       const { streamUrl, subtitles } = await resolveStream(q.id, q.s, q.e, selfBase);
+
       const proxyUrl = selfBase + '/api/hls?url=' + encodeURIComponent(streamUrl);
 
+      const defaultSubtitle = subtitles.find(s =>
+        /^en$/i.test(s.language) || /english/i.test(s.label)
+      ) || subtitles[0] || null;
+
+      // Embed this playerUrl directly in an <iframe> on your main site
+      const playerUrl = selfBase + '/player?url='
+        + encodeURIComponent(proxyUrl)
+        + (defaultSubtitle ? '&sub=' + encodeURIComponent(defaultSubtitle.proxyUrl) : '');
+
       return json(200, {
-        id:       q.id,
-        season:   q.s   || null,
-        episode:  q.e   || null,
+        id:      q.id,
+        season:  q.s  || null,
+        episode: q.e  || null,
         streamUrl,
         proxyUrl,
+        playerUrl,
         subtitles,
-        defaultSubtitle: subtitles.find(s =>
-          /^en$/i.test(s.language) || /english/i.test(s.label)
-        ) || subtitles[0] || null,
+        defaultSubtitle,
       });
     } catch (err) {
       return json(500, { error: err.message });
     }
   }
 
-  // ── /api/hls  (M3U8 / segment proxy) ────────────────────────────────────
+  // ── /api/hls ─────────────────────────────────────────────────────────────
   if (route === '/api/hls' || route === '/api/hls/') {
     if (!q.url) return json(400, { error: 'Missing required parameter: url' });
-    const url         = decodeURIComponent(q.url);
+    const url          = decodeURIComponent(q.url);
     const extraHeaders = parseEmbeddedHeaders(url);
 
     try {
@@ -216,7 +227,14 @@ module.exports = async function handler(req, res) {
       if (isM3u8) {
         const chunks = [];
         for await (const chunk of upstream) chunks.push(chunk);
-        const body      = Buffer.concat(chunks).toString('utf8');
+        const body = Buffer.concat(chunks).toString('utf8');
+
+        // CDN returned an HTML error page (Cloudflare block) instead of a manifest
+        if (body.trimStart().startsWith('<')) {
+          res.statusCode = 502;
+          return res.end('Upstream CDN returned an HTML error page (Cloudflare is blocking datacenter IPs).');
+        }
+
         const baseProxy = selfBase + '/api/hls?url=';
         res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
         return res.end(rewriteM3u8(body, url, baseProxy));
@@ -233,7 +251,7 @@ module.exports = async function handler(req, res) {
     }
   }
 
-  // ── /api/sub  (subtitle proxy + SRT→VTT) ────────────────────────────────
+  // ── /api/sub ─────────────────────────────────────────────────────────────
   if (route === '/api/sub' || route === '/api/sub/') {
     if (!q.url) return json(400, { error: 'Missing required parameter: url' });
     const url          = decodeURIComponent(q.url);

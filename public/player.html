@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Player</title>
+<script src="https://cdn.jsdelivr.net/npm/hls.js@1/dist/hls.min.js"></script>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { width: 100%; height: 100%; background: #000; overflow: hidden; }
+  video { width: 100%; height: 100%; display: block; }
+  #err {
+    display: none; position: fixed; inset: 0; background: #000;
+    color: #fff; align-items: center; justify-content: center;
+    flex-direction: column; gap: 12px; text-align: center; padding: 2rem;
+    font-family: system-ui, sans-serif;
+  }
+  #err.show { display: flex; }
+  #err h2 { font-size: 1.2rem; }
+  #err p  { font-size: .8rem; color: rgba(255,255,255,.45); max-width: 480px; word-break: break-all; }
+</style>
+</head>
+<body>
+<video id="v" controls autoplay playsinline></video>
+<div id="err">
+  <h2>Playback Error</h2>
+  <p id="err-msg"></p>
+</div>
+<script>
+  var p   = new URLSearchParams(location.search);
+  var src = p.get('url');
+  var sub = p.get('sub');
+  var v   = document.getElementById('v');
+
+  function showErr(msg) {
+    document.getElementById('err-msg').textContent = msg || 'Unknown error';
+    document.getElementById('err').classList.add('show');
+  }
+
+  if (!src) { showErr('No stream URL provided (?url= is missing).'); }
+  else {
+    // Attach subtitle track if provided
+    if (sub) {
+      var track = document.createElement('track');
+      track.kind    = 'subtitles';
+      track.label   = 'English';
+      track.srclang = 'en';
+      track.src     = sub;
+      track.default = true;
+      v.appendChild(track);
+    }
+
+    if (Hls.isSupported()) {
+      var hls = new Hls({ enableWorker: true });
+      hls.loadSource(src);
+      hls.attachMedia(v);
+      hls.on(Hls.Events.MANIFEST_PARSED, function() {
+        v.play().catch(function() {});
+      });
+      hls.on(Hls.Events.ERROR, function(_, d) {
+        if (d.fatal) showErr(d.details || 'HLS fatal error');
+      });
+    } else if (v.canPlayType('application/vnd.apple.mpegurl')) {
+      v.src = src;
+      v.play().catch(function(e) { showErr(e.message); });
+    } else {
+      showErr('HLS playback is not supported in this browser.');
+    }
+  }
+</script>
+</body>
+</html>
