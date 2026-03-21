@@ -24,7 +24,7 @@ function bootWasm() {
     globalThis.sodium = sodium;
 
     const scriptSrc = fs.readFileSync(path.join(process.cwd(), 'api', 'script.js'), 'utf8');
-eval(scriptSrc.replace(/^\s*\(\s*\(\s*\)\s*=>\s*\{/, '').replace(/\}\s*\)\s*\(\s*\)\s*;?\s*$/, ''));
+    require(path.join(process.cwd(), 'api', 'script.js'));
 
     const go     = new Dm();
     const wasmBuf = fs.readFileSync(path.join(process.cwd(), 'api', 'fu.wasm'))
