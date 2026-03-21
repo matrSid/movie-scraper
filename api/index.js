@@ -8,6 +8,9 @@ const http    = require('http');
 const REFERER = 'https://vidlink.pro/';
 const ORIGIN  = 'https://vidlink.pro';
 const UA      = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124';
+const PROXY_HOST = '142.111.67.146';
+const PROXY_PORT = 5611;
+const PROXY_AUTH = 'Basic ' + Buffer.from('hogcvrqy:a9f4srqhp92d').toString('base64');
 
 // ── WASM singleton ────────────────────────────────────────────────────────────
 let bootPromise = null;
@@ -56,28 +59,62 @@ function parseEmbeddedHeaders(url) {
 function fetchUpstream(url, redirects = 0, extraHeaders = {}) {
   return new Promise((resolve, reject) => {
     if (redirects > 5) return reject(new Error('too many redirects'));
-    (url.startsWith('https') ? https : http).get(url, {
+
+    const target  = new URL(url);
+    const isSsl   = target.protocol === 'https:';
+
+    // For HTTP proxying we CONNECT through the proxy for HTTPS targets
+    const options = {
+      host:   PROXY_HOST,
+      port:   PROXY_PORT,
+      method: 'CONNECT',
+      path:   target.host,          // host:port for CONNECT
       headers: {
-        Referer:      extraHeaders.referer || extraHeaders.Referer || REFERER,
-        Origin:       extraHeaders.origin  || extraHeaders.Origin  || ORIGIN,
+        'Proxy-Authorization': PROXY_AUTH,
         'User-Agent': UA,
-        Accept:       '*/*',
-        ...extraHeaders,
       }
-    }, res => {
-      if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
-        const loc = res.headers.location;
-        return resolve(fetchUpstream(
-          loc.startsWith('http') ? loc : new URL(loc, url).href,
-          redirects + 1,
-          extraHeaders
-        ));
+    };
+
+    const connectReq = http.request(options);
+    connectReq.on('connect', (connectRes, socket) => {
+      if (connectRes.statusCode !== 200) {
+        return reject(new Error(`Proxy CONNECT failed: ${connectRes.statusCode}`));
       }
-      resolve(res);
-    }).on('error', reject);
+
+      // Now make the real request over the tunnel
+      const req = https.get({
+        host:   target.hostname,
+        port:   target.port || 443,
+        path:   target.pathname + target.search,
+        socket,
+        agent:  false,
+        headers: {
+          Referer:      extraHeaders.referer || extraHeaders.Referer || REFERER,
+          Origin:       extraHeaders.origin  || extraHeaders.Origin  || ORIGIN,
+          'User-Agent': UA,
+          Accept:       '*/*',
+          Host:         target.hostname,
+          ...extraHeaders,
+        }
+      }, res => {
+        if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+          const loc = res.headers.location;
+          socket.destroy();
+          return resolve(fetchUpstream(
+            loc.startsWith('http') ? loc : new URL(loc, url).href,
+            redirects + 1,
+            extraHeaders
+          ));
+        }
+        resolve(res);
+      });
+      req.on('error', reject);
+      req.end();
+    });
+    connectReq.on('error', reject);
+    connectReq.end();
   });
 }
-
 // ── M3U8 rewriter ─────────────────────────────────────────────────────────────
 function rewriteM3u8(body, url, baseProxyUrl) {
   const base    = url.split('?')[0];
@@ -194,8 +231,8 @@ module.exports = async function handler(req, res) {
 
       // Embed this playerUrl directly in an <iframe> on your main site
       const playerUrl = selfBase + '/player.html?url='
-        + encodeURIComponent(streamUrl)
-        + (defaultSubtitle ? '&sub=' + encodeURIComponent(defaultSubtitle.proxyUrl) : '');
+      + encodeURIComponent(proxyUrl)
+      + (defaultSubtitle ? '&sub=' + encodeURIComponent(defaultSubtitle.proxyUrl) : '');
       return json(200, {
         id:      q.id,
         season:  q.s  || null,

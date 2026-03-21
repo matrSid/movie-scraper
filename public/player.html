@@ -52,7 +52,7 @@
         v.appendChild(track);
       }
   
-      var proxied = 'https://corsproxy.io/?' + encodeURIComponent(src);
+      var proxied = src;  // already proxied through /api/hls
   
       if (Hls.isSupported()) {
         var hls = new Hls({ enableWorker: true });
