@@ -23,10 +23,10 @@ function bootWasm() {
     await sodium.ready;
     globalThis.sodium = sodium;
 
-    eval(fs.readFileSync(path.join(__dirname, '..', 'script.js'), 'utf8'));
+    fs.readFileSync(path.join(process.cwd(), 'api', 'script.js'), 'utf8')
 
     const go     = new Dm();
-    const wasmBuf = fs.readFileSync(path.join(__dirname, '..', 'fu.wasm'));
+    const wasmBuf = fs.readFileSync(path.join(process.cwd(), 'api', 'fu.wasm'))
     const { instance } = await WebAssembly.instantiate(wasmBuf, go.importObject);
     go.run(instance);
 
