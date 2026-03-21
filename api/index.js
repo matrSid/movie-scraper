@@ -10,8 +10,9 @@ const ORIGIN  = 'https://vidlink.pro';
 const UA      = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124';
 const PROXY_HOST = '142.111.67.146';
 const PROXY_PORT = 5611;
-const PROXY_AUTH = 'Basic ' + Buffer.from('hogcvrqy:a9f4srqhp92d').toString('base64');
-
+const PROXY_USER = 'hogcvrqy';
+const PROXY_PASS = 'a9f4srqhp92d';
+const PROXY_AUTH = 'Basic ' + Buffer.from(PROXY_USER + ':' + PROXY_PASS).toString('base64');
 // ── WASM singleton ────────────────────────────────────────────────────────────
 let bootPromise = null;
 
@@ -60,59 +61,39 @@ function fetchUpstream(url, redirects = 0, extraHeaders = {}) {
   return new Promise((resolve, reject) => {
     if (redirects > 5) return reject(new Error('too many redirects'));
 
-    const target  = new URL(url);
-    const isSsl   = target.protocol === 'https:';
+    const target = new URL(url);
 
-    // For HTTP proxying we CONNECT through the proxy for HTTPS targets
+    // Send request TO the proxy, with the full target URL as the path
     const options = {
-      host:   PROXY_HOST,
-      port:   PROXY_PORT,
-      method: 'CONNECT',
-      path:   target.host,          // host:port for CONNECT
+      hostname: PROXY_HOST,
+      port:     PROXY_PORT,
+      // For HTTP proxy: path is the full absolute URL
+      path:     url,
+      method:   'GET',
       headers: {
+        Host:                 target.host,
+        Referer:              extraHeaders.referer || extraHeaders.Referer || REFERER,
+        Origin:               extraHeaders.origin  || extraHeaders.Origin  || ORIGIN,
+        'User-Agent':         UA,
+        Accept:               '*/*',
         'Proxy-Authorization': PROXY_AUTH,
-        'User-Agent': UA,
+        ...extraHeaders,
       }
     };
 
-    const connectReq = http.request(options);
-    connectReq.on('connect', (connectRes, socket) => {
-      if (connectRes.statusCode !== 200) {
-        return reject(new Error(`Proxy CONNECT failed: ${connectRes.statusCode}`));
+    // Always use http to talk TO the proxy even for https targets
+    // (the proxy handles the SSL to the destination)
+    http.get(options, res => {
+      if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+        const loc = res.headers.location;
+        return resolve(fetchUpstream(
+          loc.startsWith('http') ? loc : new URL(loc, url).href,
+          redirects + 1,
+          extraHeaders
+        ));
       }
-
-      // Now make the real request over the tunnel
-      const req = https.get({
-        host:   target.hostname,
-        port:   target.port || 443,
-        path:   target.pathname + target.search,
-        socket,
-        agent:  false,
-        headers: {
-          Referer:      extraHeaders.referer || extraHeaders.Referer || REFERER,
-          Origin:       extraHeaders.origin  || extraHeaders.Origin  || ORIGIN,
-          'User-Agent': UA,
-          Accept:       '*/*',
-          Host:         target.hostname,
-          ...extraHeaders,
-        }
-      }, res => {
-        if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
-          const loc = res.headers.location;
-          socket.destroy();
-          return resolve(fetchUpstream(
-            loc.startsWith('http') ? loc : new URL(loc, url).href,
-            redirects + 1,
-            extraHeaders
-          ));
-        }
-        resolve(res);
-      });
-      req.on('error', reject);
-      req.end();
-    });
-    connectReq.on('error', reject);
-    connectReq.end();
+      resolve(res);
+    }).on('error', reject);
   });
 }
 // ── M3U8 rewriter ─────────────────────────────────────────────────────────────
@@ -283,7 +264,7 @@ module.exports = async function handler(req, res) {
       }
     } catch (err) {
       res.statusCode = 502;
-      return res.end(err.message);
+      return res.end('HLS proxy error: ' + err.message);  // was just err.message
     }
   }
 
@@ -308,7 +289,7 @@ module.exports = async function handler(req, res) {
       return res.end(body);
     } catch (err) {
       res.statusCode = 502;
-      return res.end(err.message);
+      return res.end('Sub proxy error: ' + err.message);
     }
   }
 
