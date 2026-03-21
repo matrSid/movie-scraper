@@ -23,11 +23,10 @@ function bootWasm() {
     await sodium.ready;
     globalThis.sodium = sodium;
 
-    const scriptSrc = fs.readFileSync(path.join(process.cwd(), 'api', 'script.js'), 'utf8');
     require(path.join(process.cwd(), 'api', 'script.js'));
 
-    const go     = new Dm();
-    const wasmBuf = fs.readFileSync(path.join(process.cwd(), 'api', 'fu.wasm'))
+    const go      = new Dm();
+    const wasmBuf = fs.readFileSync(path.join(process.cwd(), 'api', 'fu.wasm'));
     const { instance } = await WebAssembly.instantiate(wasmBuf, go.importObject);
     go.run(instance);
 
@@ -37,18 +36,37 @@ function bootWasm() {
   return bootPromise;
 }
 
-// ── Upstream HTTP fetcher (redirect-aware) ────────────────────────────────────
-function fetchUpstream(url, redirects = 0) {
+// ── Parse headers embedded in a URL's query string ───────────────────────────
+// Some CDN URLs carry ?headers={"referer":"...","origin":"..."} — we must
+// forward those or the upstream returns 401.
+function parseEmbeddedHeaders(url) {
+  try {
+    const urlObj = new URL(url);
+    const raw    = urlObj.searchParams.get('headers');
+    if (raw) return JSON.parse(raw);
+  } catch (_) {}
+  return {};
+}
+
+// ── Upstream HTTP fetcher (redirect-aware, extra-headers-aware) ───────────────
+function fetchUpstream(url, redirects = 0, extraHeaders = {}) {
   return new Promise((resolve, reject) => {
     if (redirects > 5) return reject(new Error('too many redirects'));
     (url.startsWith('https') ? https : http).get(url, {
-      headers: { Referer: REFERER, Origin: ORIGIN, 'User-Agent': UA, Accept: '*/*' }
+      headers: {
+        Referer:      extraHeaders.referer || extraHeaders.Referer || REFERER,
+        Origin:       extraHeaders.origin  || extraHeaders.Origin  || ORIGIN,
+        'User-Agent': UA,
+        Accept:       '*/*',
+        ...extraHeaders,
+      }
     }, res => {
       if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
         const loc = res.headers.location;
         return resolve(fetchUpstream(
           loc.startsWith('http') ? loc : new URL(loc, url).href,
-          redirects + 1
+          redirects + 1,
+          extraHeaders
         ));
       }
       resolve(res);
@@ -100,8 +118,8 @@ function extractSubtitles(data, selfBase) {
       return {
         label,
         language,
-        url,                                                    // original URL
-        proxyUrl: selfBase + '/api/sub?url=' + encodeURIComponent(url),  // CORS-safe proxy
+        url,
+        proxyUrl: selfBase + '/api/sub?url=' + encodeURIComponent(url),
       };
     })
     .filter(t => t.url);
@@ -140,18 +158,18 @@ async function resolveStream(id, season, episode, selfBase) {
 //  GET /api/sub?url=              →  proxied subtitle (auto-converts SRT→VTT)
 // ─────────────────────────────────────────────────────────────────────────────
 module.exports = async function handler(req, res) {
-  // ── CORS — allow any origin to call this API ────────────────────────────
+  // ── CORS ────────────────────────────────────────────────────────────────
   res.setHeader('Access-Control-Allow-Origin',  '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
   if (req.method === 'OPTIONS') { res.statusCode = 204; return res.end(); }
 
-  const reqUrl  = new URL(req.url, 'http://localhost');
-  const route   = reqUrl.pathname;          // e.g. /api/stream
-  const q       = Object.fromEntries(reqUrl.searchParams);
+  const reqUrl   = new URL(req.url, 'http://localhost');
+  const route    = reqUrl.pathname;
+  const q        = Object.fromEntries(reqUrl.searchParams);
   const selfBase = process.env.VERCEL_URL
     ? `https://${process.env.VERCEL_URL}`
-    : '';                                   // empty string = relative URLs in dev
+    : '';
 
   function json(statusCode, obj) {
     res.statusCode = statusCode;
@@ -165,19 +183,15 @@ module.exports = async function handler(req, res) {
 
     try {
       const { streamUrl, subtitles } = await resolveStream(q.id, q.s, q.e, selfBase);
-
-      // The proxied HLS URL rewrites segments through /api/hls so CORS is
-      // never a problem when embedding on a different domain.
       const proxyUrl = selfBase + '/api/hls?url=' + encodeURIComponent(streamUrl);
 
       return json(200, {
-        id:        q.id,
-        season:    q.s    || null,
-        episode:   q.e    || null,
-        streamUrl,          // raw M3U8 (use if you control the player host)
-        proxyUrl,           // CORS-safe proxied M3U8 (use for cross-origin embeds)
-        subtitles,          // [{ label, language, url, proxyUrl }]
-        // Convenience: English track first (or null)
+        id:       q.id,
+        season:   q.s   || null,
+        episode:  q.e   || null,
+        streamUrl,
+        proxyUrl,
+        subtitles,
         defaultSubtitle: subtitles.find(s =>
           /^en$/i.test(s.language) || /english/i.test(s.label)
         ) || subtitles[0] || null,
@@ -190,9 +204,11 @@ module.exports = async function handler(req, res) {
   // ── /api/hls  (M3U8 / segment proxy) ────────────────────────────────────
   if (route === '/api/hls' || route === '/api/hls/') {
     if (!q.url) return json(400, { error: 'Missing required parameter: url' });
-    const url = decodeURIComponent(q.url);
+    const url         = decodeURIComponent(q.url);
+    const extraHeaders = parseEmbeddedHeaders(url);
+
     try {
-      const upstream = await fetchUpstream(url);
+      const upstream = await fetchUpstream(url, 0, extraHeaders);
       const ct       = (upstream.headers['content-type'] || '').toLowerCase();
       const isM3u8   = ct.includes('mpegurl') || ct.includes('m3u8')
                     || /\.m3u8?(\?|$)/i.test(url.split('?')[0]);
@@ -200,7 +216,7 @@ module.exports = async function handler(req, res) {
       if (isM3u8) {
         const chunks = [];
         for await (const chunk of upstream) chunks.push(chunk);
-        const body    = Buffer.concat(chunks).toString('utf8');
+        const body      = Buffer.concat(chunks).toString('utf8');
         const baseProxy = selfBase + '/api/hls?url=';
         res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
         return res.end(rewriteM3u8(body, url, baseProxy));
@@ -220,9 +236,11 @@ module.exports = async function handler(req, res) {
   // ── /api/sub  (subtitle proxy + SRT→VTT) ────────────────────────────────
   if (route === '/api/sub' || route === '/api/sub/') {
     if (!q.url) return json(400, { error: 'Missing required parameter: url' });
-    const url = decodeURIComponent(q.url);
+    const url          = decodeURIComponent(q.url);
+    const extraHeaders = parseEmbeddedHeaders(url);
+
     try {
-      const upstream = await fetchUpstream(url);
+      const upstream = await fetchUpstream(url, 0, extraHeaders);
       const chunks   = [];
       for await (const chunk of upstream) chunks.push(chunk);
       let body = Buffer.concat(chunks).toString('utf8');
@@ -240,7 +258,7 @@ module.exports = async function handler(req, res) {
     }
   }
 
-  // ── 404 for anything else ────────────────────────────────────────────────
+  // ── 404 ──────────────────────────────────────────────────────────────────
   return json(404, {
     error: 'Not found',
     routes: {
