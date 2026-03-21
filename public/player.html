@@ -29,8 +29,8 @@
 <script src="https://cdn.jsdelivr.net/npm/hls.js@1/dist/hls.min.js"></script>
 <script>
     var p   = new URLSearchParams(location.search);
-    var src = p.get('url');   // raw streamUrl
-    var sub = p.get('sub');   // /api/sub?url=... proxied subtitle
+    var src = p.get('url');
+    var sub = p.get('sub');
     var v   = document.getElementById('v');
   
     function showErr(msg) {
@@ -38,30 +38,39 @@
       document.getElementById('err').classList.add('show');
     }
   
-    if (!src) return showErr('No stream URL provided.');
-  
-    // Subtitle still goes through your /api/sub proxy (handles CORS fine)
-    if (sub) {
-      var track = document.createElement('track');
-      track.kind = 'subtitles'; track.label = 'English';
-      track.srclang = 'en'; track.src = sub; track.default = true;
-      v.appendChild(track);
-    }
-  
-    // Wrap the M3U8 through corsproxy.io to get past the Cloudflare block
-    var proxied = 'https://corsproxy.io/?' + encodeURIComponent(src);
-  
-    if (Hls.isSupported()) {
-      var hls = new Hls({ enableWorker: true });
-      hls.loadSource(proxied);
-      hls.attachMedia(v);
-      hls.on(Hls.Events.MANIFEST_PARSED, function() { v.play().catch(function(){}); });
-      hls.on(Hls.Events.ERROR, function(_, d) { if (d.fatal) showErr(d.details); });
-    } else if (v.canPlayType('application/vnd.apple.mpegurl')) {
-      v.src = proxied;
-      v.play().catch(function(e) { showErr(e.message); });
+    if (!src) {
+      showErr('No stream URL provided.');
     } else {
-      showErr('HLS not supported in this browser.');
+  
+      if (sub) {
+        var track = document.createElement('track');
+        track.kind = 'subtitles';
+        track.label = 'English';
+        track.srclang = 'en';
+        track.src = sub;
+        track.default = true;
+        v.appendChild(track);
+      }
+  
+      var proxied = 'https://corsproxy.io/?' + encodeURIComponent(src);
+  
+      if (Hls.isSupported()) {
+        var hls = new Hls({ enableWorker: true });
+        hls.loadSource(proxied);
+        hls.attachMedia(v);
+        hls.on(Hls.Events.MANIFEST_PARSED, function() {
+          v.play().catch(function(){});
+        });
+        hls.on(Hls.Events.ERROR, function(_, d) {
+          if (d.fatal) showErr(d.details);
+        });
+      } else if (v.canPlayType('application/vnd.apple.mpegurl')) {
+        v.src = proxied;
+        v.play().catch(function(e) { showErr(e.message); });
+      } else {
+        showErr('HLS not supported in this browser.');
+      }
+  
     }
   </script>
 </body>
