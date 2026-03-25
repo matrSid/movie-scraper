@@ -3,101 +3,95 @@
 const RUST_PROXY = 'https://rust-proxy-zh79.onrender.com/';
 const UA         = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124';
 
-// ── Scrape videasy player page to get the m3u8 URL ───────────────────────────
-// Strategy (tried in order):
-//   1. Fetch the player page HTML, look for the workers.dev m3u8 URL directly
-//   2. Parse __NEXT_DATA__ JSON embedded in the page
-//   3. Find any /api/ endpoint referenced in the page and call it
-async function resolveVideasy(id, season, episode) {
-  const pageUrl = season
-    ? `https://player.videasy.net/tv/${id}/${season}/${episode || 1}`
-    : `https://player.videasy.net/movie/${id}`;
+// Free TMDB API key (v3 read-only public key — replace with your own if needed)
+// You can get one free at https://www.themoviedb.org/settings/api
+const TMDB_KEY   = process.env.TMDB_API_KEY || '86da74c5c11f2b69a4ce724f254ac312';
 
-  const pageRes = await fetch(pageUrl, {
+// ── Step 1: Get title/year/imdbId from TMDB ───────────────────────────────────
+async function getTmdbMeta(tmdbId, mediaType) {
+  if (!TMDB_KEY) throw new Error('TMDB_API_KEY env var not set');
+
+  const type   = mediaType === 'tv' ? 'tv' : 'movie';
+  const url     = `https://api.themoviedb.org/3/${type}/${tmdbId}?api_key=${TMDB_KEY}&append_to_response=external_ids`;
+  const res     = await fetch(url, { headers: { 'User-Agent': UA } });
+  if (!res.ok) throw new Error(`TMDB returned ${res.status} for id ${tmdbId}`);
+
+  const data    = await res.json();
+  const title   = data.title || data.name || '';
+  const year    = (data.release_date || data.first_air_date || '').slice(0, 4);
+  const imdbId  = data.imdb_id || data.external_ids?.imdb_id || '';
+
+  if (!title) throw new Error('TMDB returned no title');
+  return { title, year, imdbId };
+}
+
+// ── Step 2: Call videasy API to get the m3u8 URL ─────────────────────────────
+async function resolveVideasy(tmdbId, season, episode) {
+  const mediaType = season ? 'tv' : 'movie';
+  const { title, year, imdbId } = await getTmdbMeta(tmdbId, mediaType);
+
+  const params = new URLSearchParams({
+    title:     title,
+    mediaType: mediaType,
+    year:      year,
+    episodeId: episode || '1',
+    seasonId:  season  || '1',
+    tmdbId:    String(tmdbId),
+    imdbId:    imdbId,
+  });
+
+  const apiUrl = `https://api.videasy.net/myflixerzupcloud/sources-with-title?${params}`;
+  const res    = await fetch(apiUrl, {
     headers: {
       'User-Agent': UA,
-      'Accept':     'text/html,application/xhtml+xml,*/*;q=0.9',
-      'Referer':    'https://videasy.net/',
+      'Referer':    'https://player.videasy.net/',
+      'Origin':     'https://player.videasy.net',
     }
   });
 
-  if (!pageRes.ok) throw new Error(`videasy page returned ${pageRes.status}`);
-  const html = await pageRes.text();
+  if (!res.ok) throw new Error(`videasy API returned ${res.status}`);
 
-  // ── Strategy 1: direct URL in HTML ───────────────────────────────────────
-  // Matches: https://bold.uskevinpowell89.workers.dev/video.m3u8?q=TOKEN|
-  const directMatch = html.match(
-    /https?:\/\/[^"'\s]+workers\.dev\/video\.m3u8\?q=[A-Za-z0-9+/=_|%-]+/
-  );
-  if (directMatch) {
-    // Strip trailing pipe if present (seen in the wild: ?q=TOKEN|)
-    return directMatch[0].replace(/\|$/, '');
+  const data = await res.json();
+
+  // Response shape is unknown — try common patterns
+  // Pattern A: { url: "...m3u8" }
+  // Pattern B: { sources: [{ url: "...m3u8" }] }
+  // Pattern C: { stream: { url: "..." } }
+  // Pattern D: { data: { url: "..." } }
+  const m3u8 = data?.url
+    || data?.stream?.url
+    || data?.data?.url
+    || data?.sources?.[0]?.url
+    || data?.data?.sources?.[0]?.url
+    || findM3u8InObject(data);
+
+  if (!m3u8) {
+    // Return raw response so we can inspect it and adjust
+    throw new Error('videasy: could not find m3u8 in response: ' + JSON.stringify(data).slice(0, 500));
   }
 
-  // ── Strategy 2: __NEXT_DATA__ JSON ───────────────────────────────────────
-  const nextDataMatch = html.match(/<script id="__NEXT_DATA__"[^>]*>(\{.+?\})<\/script>/s);
-  if (nextDataMatch) {
-    try {
-      const nextData = JSON.parse(nextDataMatch[1]);
-      // Walk the props tree looking for anything that looks like an m3u8 URL
-      const found = findM3u8InObject(nextData);
-      if (found) return found;
-    } catch (_) {}
-  }
-
-  // ── Strategy 3: find inline JSON blobs with a stream/source key ──────────
-  // Some players embed { "source": "https://...m3u8..." } in a script tag
-  const jsonBlobMatch = html.match(/"(?:source|stream|url|playlist|file)"\s*:\s*"(https?:\/\/[^"]+\.m3u8[^"]*)"/);
-  if (jsonBlobMatch) return jsonBlobMatch[1];
-
-  // ── Strategy 4: find the API endpoint the page would call ─────────────────
-  // e.g.  /api/source/550   or   /api/stream?id=550
-  const apiPathMatch = html.match(/(?:fetch|axios\.get)\s*\(\s*["'`](\/api\/[^"'`]+)["'`]/);
-  if (apiPathMatch) {
-    const apiUrl = 'https://player.videasy.net' + apiPathMatch[1]
-      .replace(':id',      id)
-      .replace('{id}',     id)
-      .replace(':movieId', id);
-
-    const apiRes = await fetch(apiUrl, {
-      headers: { 'User-Agent': UA, 'Referer': pageUrl }
-    });
-    if (apiRes.ok) {
-      const apiData = await apiRes.json().catch(() => null);
-      if (apiData) {
-        const found = findM3u8InObject(apiData);
-        if (found) return found;
-      }
-    }
-  }
-
-  // ── Strategy 5: brute-force any m3u8 URL in the HTML ─────────────────────
-  const anyM3u8 = html.match(/https?:\/\/[^"'\s<>]+\.m3u8(?:\?[^"'\s<>]*)?/);
-  if (anyM3u8) return anyM3u8[0];
-
-  throw new Error('Could not find m3u8 URL in videasy page — page structure may have changed');
+  return { m3u8, title, year, imdbId };
 }
 
 // Recursively walk a parsed JSON object looking for an m3u8 URL string
 function findM3u8InObject(obj, depth = 0) {
-  if (depth > 10) return null;
-  if (typeof obj === 'string' && obj.includes('.m3u8')) return obj;
+  if (depth > 8) return null;
+  if (typeof obj === 'string' && (obj.includes('.m3u8') || obj.includes('workers.dev'))) return obj;
   if (Array.isArray(obj)) {
     for (const item of obj) {
-      const found = findM3u8InObject(item, depth + 1);
-      if (found) return found;
+      const f = findM3u8InObject(item, depth + 1);
+      if (f) return f;
     }
   } else if (obj && typeof obj === 'object') {
     for (const val of Object.values(obj)) {
-      const found = findM3u8InObject(val, depth + 1);
-      if (found) return found;
+      const f = findM3u8InObject(val, depth + 1);
+      if (f) return f;
     }
   }
   return null;
 }
 
 // ── Parse headers + host embedded in a CDN URL's query string ────────────────
-// Returns { headers, cleanUrl } — cleanUrl has ?headers= and ?host= stripped.
 function parseEmbeddedHeaders(url) {
   try {
     const urlObj = new URL(url);
@@ -117,15 +111,11 @@ function parseEmbeddedHeaders(url) {
 
 // ── Fetch via Rust proxy ──────────────────────────────────────────────────────
 async function fetchUpstream(url, extraHeaders = {}) {
-  const headersObj = {
-    'User-Agent': UA,
-    ...(extraHeaders.referer || extraHeaders.Referer
-      ? { Referer: extraHeaders.referer || extraHeaders.Referer }
-      : {}),
-    ...(extraHeaders.origin || extraHeaders.Origin
-      ? { Origin: extraHeaders.origin || extraHeaders.Origin }
-      : {}),
-  };
+  const headersObj = { 'User-Agent': UA };
+  const ref = extraHeaders.referer || extraHeaders.Referer;
+  const ori = extraHeaders.origin  || extraHeaders.Origin;
+  if (ref) headersObj.Referer = ref;
+  if (ori) headersObj.Origin  = ori;
 
   const proxyUrl = RUST_PROXY
     + '?url='     + encodeURIComponent(url)
@@ -210,15 +200,18 @@ module.exports = async function handler(req, res) {
     if (!q.id) return json(400, { error: 'Missing required parameter: id' });
 
     try {
-      const streamUrl = await resolveVideasy(q.id, q.s, q.e);
-      const proxyUrl  = selfBase + '/api/hls?url=' + encodeURIComponent(streamUrl);
+      const { m3u8, title, year, imdbId } = await resolveVideasy(q.id, q.s, q.e);
+      const proxyUrl  = selfBase + '/api/hls?url=' + encodeURIComponent(m3u8);
       const playerUrl = selfBase + '/player.html?url=' + encodeURIComponent(proxyUrl);
 
       return json(200, {
         id:      q.id,
         season:  q.s  || null,
         episode: q.e  || null,
-        streamUrl,
+        title,
+        year,
+        imdbId,
+        streamUrl: m3u8,
         proxyUrl,
         playerUrl,
         subtitles:       [],
@@ -233,12 +226,12 @@ module.exports = async function handler(req, res) {
   if (route === '/api/hls' || route === '/api/hls/') {
     if (!q.url) return json(400, { error: 'Missing required parameter: url' });
 
-    const url                       = decodeURIComponent(q.url);
-    const { headers: extraHeaders,
-            cleanUrl }              = parseEmbeddedHeaders(url);
+    const url                  = decodeURIComponent(q.url);
+    const { headers: xh,
+            cleanUrl }         = parseEmbeddedHeaders(url);
 
     try {
-      const upstream = await fetchUpstream(cleanUrl, extraHeaders);
+      const upstream = await fetchUpstream(cleanUrl, xh);
 
       if (!upstream.ok && upstream.status !== 206) {
         res.statusCode = upstream.status;
@@ -252,12 +245,10 @@ module.exports = async function handler(req, res) {
 
       if (isM3u8) {
         const body = await upstream.text();
-
         if (body.trimStart().startsWith('<')) {
           res.statusCode = 502;
           return res.end('Upstream returned an HTML error page (CDN block).');
         }
-
         res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
         res.statusCode = 200;
         return res.end(rewriteM3u8(body, cleanUrl, selfBase));
@@ -278,12 +269,12 @@ module.exports = async function handler(req, res) {
   if (route === '/api/sub' || route === '/api/sub/') {
     if (!q.url) return json(400, { error: 'Missing required parameter: url' });
 
-    const url                       = decodeURIComponent(q.url);
-    const { headers: extraHeaders,
-            cleanUrl }              = parseEmbeddedHeaders(url);
+    const url              = decodeURIComponent(q.url);
+    const { headers: xh,
+            cleanUrl }     = parseEmbeddedHeaders(url);
 
     try {
-      const upstream = await fetchUpstream(cleanUrl, extraHeaders);
+      const upstream = await fetchUpstream(cleanUrl, xh);
       let body       = await upstream.text();
 
       const ct    = (upstream.headers.get('content-type') || '').toLowerCase();
@@ -303,7 +294,7 @@ module.exports = async function handler(req, res) {
   return json(404, {
     error: 'Not found',
     routes: {
-      'GET /api/stream': { params: 'id (required), s (season), e (episode)' },
+      'GET /api/stream': { params: 'id (tmdbId, required), s (season), e (episode)' },
       'GET /api/hls':    { params: 'url (encoded M3U8/segment URL)' },
       'GET /api/sub':    { params: 'url (encoded subtitle URL)' },
     },
