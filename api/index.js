@@ -36,6 +36,8 @@ function bootWasm() {
 }
 
 // ── Parse headers + host embedded in a CDN URL's query string ────────────────
+// Returns { headers, cleanUrl } where cleanUrl has ?headers= and ?host= stripped
+// so the CDN never receives those meta-params.
 function parseEmbeddedHeaders(url) {
   try {
     const urlObj = new URL(url);
@@ -46,17 +48,17 @@ function parseEmbeddedHeaders(url) {
       parsed.referer = parsed.referer || (host + '/');
       parsed.origin  = parsed.origin  || host;
     }
-    return parsed;
+    // Strip our meta-params before forwarding to CDN
+    urlObj.searchParams.delete('headers');
+    urlObj.searchParams.delete('host');
+    return { headers: parsed, cleanUrl: urlObj.toString() };
   } catch (_) {}
-  return {};
+  return { headers: {}, cleanUrl: url };
 }
 
 // ── Fetch via Rust proxy ──────────────────────────────────────────────────────
-// Builds a proxied URL and returns a standard fetch() Response.
-// The Rust proxy accepts:
-//   ?url=<encoded>
-//   &headers=<url-encoded JSON object>   e.g. {"Referer":"...","Origin":"..."}
-//   &origin=<string>                     (alternative to headers.Origin)
+// url should be the CLEAN url (no ?headers=/?host= junk).
+// extraHeaders are forwarded to the CDN via the Rust proxy's &headers= param.
 async function fetchUpstream(url, extraHeaders = {}) {
   const headersObj = {
     Referer:      extraHeaders.referer || extraHeaders.Referer || REFERER,
@@ -72,11 +74,8 @@ async function fetchUpstream(url, extraHeaders = {}) {
 }
 
 // ── M3U8 rewriter ─────────────────────────────────────────────────────────────
-// The Rust proxy auto-rewrites .m3u8 segment lines to point back at itself
-// (e.g. https://rust-proxy-zh79.onrender.com/?url=<original>).
-// We accept both that form and raw relative/absolute URLs, resolving everything
-// to absolute form and then routing through our own /api/hls (so headers stay
-// consistent on every segment request).
+// Rewrites every segment / child-playlist line to go through /api/hls.
+// Handles lines the Rust proxy may have already rewritten to point at itself.
 function rewriteM3u8(body, originalUrl, selfBase) {
   const base    = originalUrl.split('?')[0];
   const baseDir = base.substring(0, base.lastIndexOf('/') + 1);
@@ -87,15 +86,10 @@ function rewriteM3u8(body, originalUrl, selfBase) {
     if (!t || t.startsWith('#')) return line;
 
     let absUrl;
-
     if (t.startsWith(RUST_PROXY)) {
-      // The Rust proxy has already rewritten this line — unwrap the original URL
-      // so we can re-route it through our own /api/hls with proper headers.
-      try {
-        absUrl = new URL(t).searchParams.get('url') || t;
-      } catch (_) {
-        absUrl = t;
-      }
+      // Rust proxy has already rewritten this line — unwrap the original URL
+      try { absUrl = new URL(t).searchParams.get('url') || t; }
+      catch (_) { absUrl = t; }
     } else if (t.startsWith('http')) {
       absUrl = t;
     } else if (t.startsWith('/')) {
@@ -244,11 +238,12 @@ module.exports = async function handler(req, res) {
   if (route === '/api/hls' || route === '/api/hls/') {
     if (!q.url) return json(400, { error: 'Missing required parameter: url' });
 
-    const url          = decodeURIComponent(q.url);
-    const extraHeaders = parseEmbeddedHeaders(url);
+    const url                       = decodeURIComponent(q.url);
+    const { headers: extraHeaders,
+            cleanUrl }              = parseEmbeddedHeaders(url);
 
     try {
-      const upstream = await fetchUpstream(url, extraHeaders);
+      const upstream = await fetchUpstream(cleanUrl, extraHeaders);
 
       if (!upstream.ok && upstream.status !== 206) {
         res.statusCode = upstream.status;
@@ -256,13 +251,15 @@ module.exports = async function handler(req, res) {
       }
 
       const ct     = (upstream.headers.get('content-type') || '').toLowerCase();
+      // Check extension on both raw and clean URL (extension may live in an
+      // encoded path segment before the query string)
       const isM3u8 = ct.includes('mpegurl') || ct.includes('m3u8')
+                  || /\.m3u8?(\?|$)/i.test(cleanUrl.split('?')[0])
                   || /\.m3u8?(\?|$)/i.test(url.split('?')[0]);
 
       if (isM3u8) {
         const body = await upstream.text();
 
-        // Guard: CDN returned an HTML error page instead of a manifest
         if (body.trimStart().startsWith('<')) {
           res.statusCode = 502;
           return res.end('Upstream returned an HTML error page (CDN block).');
@@ -270,9 +267,9 @@ module.exports = async function handler(req, res) {
 
         res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
         res.statusCode = 200;
-        return res.end(rewriteM3u8(body, url, selfBase));
+        // Use cleanUrl as base for resolving relative segment URLs
+        return res.end(rewriteM3u8(body, cleanUrl, selfBase));
       } else {
-        // Binary segment — stream it straight through
         res.setHeader('Content-Type', ct || 'application/octet-stream');
         const cl = upstream.headers.get('content-length');
         if (cl) res.setHeader('Content-Length', cl);
@@ -289,11 +286,12 @@ module.exports = async function handler(req, res) {
   if (route === '/api/sub' || route === '/api/sub/') {
     if (!q.url) return json(400, { error: 'Missing required parameter: url' });
 
-    const url          = decodeURIComponent(q.url);
-    const extraHeaders = parseEmbeddedHeaders(url);
+    const url                       = decodeURIComponent(q.url);
+    const { headers: extraHeaders,
+            cleanUrl }              = parseEmbeddedHeaders(url);
 
     try {
-      const upstream = await fetchUpstream(url, extraHeaders);
+      const upstream = await fetchUpstream(cleanUrl, extraHeaders);
       let body       = await upstream.text();
 
       const ct    = (upstream.headers.get('content-type') || '').toLowerCase();
