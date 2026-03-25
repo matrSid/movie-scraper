@@ -1,18 +1,13 @@
 'use strict';
 
-const fs      = require('fs');
-const path    = require('path');
-const https   = require('https');
-const http    = require('http');
+const fs   = require('fs');
+const path = require('path');
 
-const REFERER = 'https://vidlink.pro/';
-const ORIGIN  = 'https://vidlink.pro';
-const UA      = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124';
-const PROXY_HOST = '142.111.67.146';
-const PROXY_PORT = 5611;
-const PROXY_USER = 'hogcvrqy';
-const PROXY_PASS = 'a9f4srqhp92d';
-const PROXY_AUTH = 'Basic ' + Buffer.from(PROXY_USER + ':' + PROXY_PASS).toString('base64');
+const REFERER    = 'https://vidlink.pro/';
+const ORIGIN     = 'https://vidlink.pro';
+const UA         = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124';
+const RUST_PROXY = 'https://rust-proxy-zh79.onrender.com/';
+
 // ── WASM singleton ────────────────────────────────────────────────────────────
 let bootPromise = null;
 
@@ -56,58 +51,60 @@ function parseEmbeddedHeaders(url) {
   return {};
 }
 
-// ── Upstream HTTP fetcher (redirect-aware, extra-headers-aware) ───────────────
-function fetchUpstream(url, redirects = 0, extraHeaders = {}) {
-  return new Promise((resolve, reject) => {
-    if (redirects > 5) return reject(new Error('too many redirects'));
+// ── Fetch via Rust proxy ──────────────────────────────────────────────────────
+// Builds a proxied URL and returns a standard fetch() Response.
+// The Rust proxy accepts:
+//   ?url=<encoded>
+//   &headers=<url-encoded JSON object>   e.g. {"Referer":"...","Origin":"..."}
+//   &origin=<string>                     (alternative to headers.Origin)
+async function fetchUpstream(url, extraHeaders = {}) {
+  const headersObj = {
+    Referer:      extraHeaders.referer || extraHeaders.Referer || REFERER,
+    Origin:       extraHeaders.origin  || extraHeaders.Origin  || ORIGIN,
+    'User-Agent': UA,
+  };
 
-    const target = new URL(url);
+  const proxyUrl = RUST_PROXY
+    + '?url='     + encodeURIComponent(url)
+    + '&headers=' + encodeURIComponent(JSON.stringify(headersObj));
 
-    // Send request TO the proxy, with the full target URL as the path
-    const options = {
-      hostname: PROXY_HOST,
-      port:     PROXY_PORT,
-      // For HTTP proxy: path is the full absolute URL
-      path:     url,
-      method:   'GET',
-      headers: {
-        Host:                 target.host,
-        Referer:              extraHeaders.referer || extraHeaders.Referer || REFERER,
-        Origin:               extraHeaders.origin  || extraHeaders.Origin  || ORIGIN,
-        'User-Agent':         UA,
-        Accept:               '*/*',
-        'Proxy-Authorization': PROXY_AUTH,
-        ...extraHeaders,
-      }
-    };
-
-    // Always use http to talk TO the proxy even for https targets
-    // (the proxy handles the SSL to the destination)
-    http.get(options, res => {
-      if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
-        const loc = res.headers.location;
-        return resolve(fetchUpstream(
-          loc.startsWith('http') ? loc : new URL(loc, url).href,
-          redirects + 1,
-          extraHeaders
-        ));
-      }
-      resolve(res);
-    }).on('error', reject);
-  });
+  return fetch(proxyUrl);
 }
+
 // ── M3U8 rewriter ─────────────────────────────────────────────────────────────
-function rewriteM3u8(body, url, baseProxyUrl) {
-  const base    = url.split('?')[0];
+// The Rust proxy auto-rewrites .m3u8 segment lines to point back at itself
+// (e.g. https://rust-proxy-zh79.onrender.com/?url=<original>).
+// We accept both that form and raw relative/absolute URLs, resolving everything
+// to absolute form and then routing through our own /api/hls (so headers stay
+// consistent on every segment request).
+function rewriteM3u8(body, originalUrl, selfBase) {
+  const base    = originalUrl.split('?')[0];
   const baseDir = base.substring(0, base.lastIndexOf('/') + 1);
-  const origin  = new URL(url).origin;
+  const origin  = new URL(originalUrl).origin;
+
   return body.split('\n').map(line => {
     const t = line.trim();
     if (!t || t.startsWith('#')) return line;
-    const abs = t.startsWith('http') ? t
-              : t.startsWith('/')    ? origin + t
-              :                        baseDir + t;
-    return baseProxyUrl + encodeURIComponent(abs);
+
+    let absUrl;
+
+    if (t.startsWith(RUST_PROXY)) {
+      // The Rust proxy has already rewritten this line — unwrap the original URL
+      // so we can re-route it through our own /api/hls with proper headers.
+      try {
+        absUrl = new URL(t).searchParams.get('url') || t;
+      } catch (_) {
+        absUrl = t;
+      }
+    } else if (t.startsWith('http')) {
+      absUrl = t;
+    } else if (t.startsWith('/')) {
+      absUrl = origin + t;
+    } else {
+      absUrl = baseDir + t;
+    }
+
+    return selfBase + '/api/hls?url=' + encodeURIComponent(absUrl);
   }).join('\n');
 }
 
@@ -173,6 +170,21 @@ async function resolveStream(id, season, episode, selfBase) {
   };
 }
 
+// ── Pipe a fetch Response body into a Node ServerResponse ─────────────────────
+async function pipeResponse(fetchRes, nodeRes) {
+  const reader = fetchRes.body.getReader();
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      nodeRes.write(value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  nodeRes.end();
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 module.exports = async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin',  '*');
@@ -180,11 +192,10 @@ module.exports = async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
   if (req.method === 'OPTIONS') { res.statusCode = 204; return res.end(); }
 
-  const reqUrl   = new URL(req.url, 'http://localhost');
-  const route    = reqUrl.pathname;
-  const q        = Object.fromEntries(reqUrl.searchParams);
+  const reqUrl = new URL(req.url, 'http://localhost');
+  const route  = reqUrl.pathname;
+  const q      = Object.fromEntries(reqUrl.searchParams);
 
-  // Prefer the stable production URL over the per-deployment preview URL
   const selfBase = process.env.VERCEL_PROJECT_PRODUCTION_URL
     ? `https://${process.env.VERCEL_PROJECT_PRODUCTION_URL}`
     : process.env.VERCEL_URL
@@ -210,10 +221,10 @@ module.exports = async function handler(req, res) {
         /^en$/i.test(s.language) || /english/i.test(s.label)
       ) || subtitles[0] || null;
 
-      // Embed this playerUrl directly in an <iframe> on your main site
       const playerUrl = selfBase + '/player.html?url='
-      + encodeURIComponent(proxyUrl)
-      + (defaultSubtitle ? '&sub=' + encodeURIComponent(defaultSubtitle.proxyUrl) : '');
+        + encodeURIComponent(proxyUrl)
+        + (defaultSubtitle ? '&sub=' + encodeURIComponent(defaultSubtitle.proxyUrl) : '');
+
       return json(200, {
         id:      q.id,
         season:  q.s  || null,
@@ -232,55 +243,60 @@ module.exports = async function handler(req, res) {
   // ── /api/hls ─────────────────────────────────────────────────────────────
   if (route === '/api/hls' || route === '/api/hls/') {
     if (!q.url) return json(400, { error: 'Missing required parameter: url' });
+
     const url          = decodeURIComponent(q.url);
     const extraHeaders = parseEmbeddedHeaders(url);
 
     try {
-      const upstream = await fetchUpstream(url, 0, extraHeaders);
-      const ct       = (upstream.headers['content-type'] || '').toLowerCase();
-      const isM3u8   = ct.includes('mpegurl') || ct.includes('m3u8')
-                    || /\.m3u8?(\?|$)/i.test(url.split('?')[0]);
+      const upstream = await fetchUpstream(url, extraHeaders);
+
+      if (!upstream.ok && upstream.status !== 206) {
+        res.statusCode = upstream.status;
+        return res.end('Upstream error: ' + upstream.status);
+      }
+
+      const ct     = (upstream.headers.get('content-type') || '').toLowerCase();
+      const isM3u8 = ct.includes('mpegurl') || ct.includes('m3u8')
+                  || /\.m3u8?(\?|$)/i.test(url.split('?')[0]);
 
       if (isM3u8) {
-        const chunks = [];
-        for await (const chunk of upstream) chunks.push(chunk);
-        const body = Buffer.concat(chunks).toString('utf8');
+        const body = await upstream.text();
 
-        // CDN returned an HTML error page (Cloudflare block) instead of a manifest
+        // Guard: CDN returned an HTML error page instead of a manifest
         if (body.trimStart().startsWith('<')) {
           res.statusCode = 502;
-          return res.end('Upstream CDN returned an HTML error page (Cloudflare is blocking datacenter IPs).');
+          return res.end('Upstream returned an HTML error page (CDN block).');
         }
 
-        const baseProxy = selfBase + '/api/hls?url=';
         res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
-        return res.end(rewriteM3u8(body, url, baseProxy));
+        res.statusCode = 200;
+        return res.end(rewriteM3u8(body, url, selfBase));
       } else {
+        // Binary segment — stream it straight through
         res.setHeader('Content-Type', ct || 'application/octet-stream');
-        if (upstream.headers['content-length'])
-          res.setHeader('Content-Length', upstream.headers['content-length']);
-        res.statusCode = upstream.statusCode;
-        return upstream.pipe(res);
+        const cl = upstream.headers.get('content-length');
+        if (cl) res.setHeader('Content-Length', cl);
+        res.statusCode = upstream.status;
+        return pipeResponse(upstream, res);
       }
     } catch (err) {
       res.statusCode = 502;
-      return res.end('HLS proxy error: ' + err.message);  // was just err.message
+      return res.end('HLS proxy error: ' + err.message);
     }
   }
 
   // ── /api/sub ─────────────────────────────────────────────────────────────
   if (route === '/api/sub' || route === '/api/sub/') {
     if (!q.url) return json(400, { error: 'Missing required parameter: url' });
+
     const url          = decodeURIComponent(q.url);
     const extraHeaders = parseEmbeddedHeaders(url);
 
     try {
-      const upstream = await fetchUpstream(url, 0, extraHeaders);
-      const chunks   = [];
-      for await (const chunk of upstream) chunks.push(chunk);
-      let body = Buffer.concat(chunks).toString('utf8');
+      const upstream = await fetchUpstream(url, extraHeaders);
+      let body       = await upstream.text();
 
-      const ct    = (upstream.headers['content-type'] || '').toLowerCase();
+      const ct    = (upstream.headers.get('content-type') || '').toLowerCase();
       const isSrt = !ct.includes('vtt') &&
                     (url.includes('.srt') || /^\d+\r?\n\d{2}:\d{2}/.test(body.trim()));
       if (isSrt) body = srtToVtt(body);
